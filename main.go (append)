@@ -1,0 +1,12 @@
+func probeURL(endpoint string) string {
+	if endpoint == "" {
+		return endpoint
+	}
+	if strings.Contains(endpoint, "/probe") {
+		return endpoint
+	}
+	if strings.HasSuffix(endpoint, "/mesh") {
+		return strings.TrimSuffix(endpoint, "/mesh") + "/probe"
+	}
+	return strings.TrimRight(endpoint, "/") + "/probe"
+}

@@ -1,0 +1,14 @@
+version: "3.9"
+services:
+  controller:
+    build: .
+    image: 24802117/arouter:latest
+    ports:
+      - "8080:8080"
+    environment:
+      - CONTROLLER_ADDR=:8080
+      - DB_DSN=
+      - WEB_DIST=/app/web/dist
+    volumes:
+      - ./web/dist:/app/web/dist:ro
+      - ./arouter.db:/app/arouter.db

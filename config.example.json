@@ -1,17 +1,22 @@
 {
   "id": "node-a",
   "ws_listen": ":18080",
+  "quic_listen": ":18080",
+  "quic_server_name": "arouter.529851.xyz",
+  "quic_max_idle": "20s",
+  "quic_max_datagram_size": 1350,
   "peers": {
     "node-b": "ws://127.0.0.1:18081/mesh",
     "node-c": "ws://127.0.0.1:18082/mesh"
   },
   "poll_period": "5s",
+  "transport": "quic",
   "auth_key": "changeme-shared-hmac-key",
   "metrics_listen": ":19090",
   "reroute_attempts": 2,
   "udp_session_ttl": "60s",
-  "mtls_cert": "",
-  "mtls_key": "",
+  "mtls_cert": "/opt/arouter/certs/arouter.crt",
+  "mtls_key": "/opt/arouter/certs/arouter.key",
   "mtls_ca": "",
   "insecure_skip_tls": true,
   "entries": [

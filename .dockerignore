@@ -1,0 +1,6 @@
+golang-backend/public/
+publish_beta.sh
+.gocache
+dist/
+web/node_modules
+./scripts/upload_static_to_server.sh

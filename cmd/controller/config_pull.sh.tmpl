@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+INSTALL_DIR="__INSTALL_DIR__"
+CONFIG_URL="__CONFIG_URL__"
+TOKEN_OVERRIDE="__TOKEN__"
+PROXY_PREFIX_OVERRIDE="__PROXY_PREFIX__"
+mkdir -p "${INSTALL_DIR}"
+
+# ensure os/dir hint exists
+SEP="?"
+[[ "${CONFIG_URL}" == *"?"* ]] && SEP="&"
+if [[ "${CONFIG_URL}" != *"os="* ]]; then
+  CONFIG_URL="${CONFIG_URL}${SEP}os=${OS}"
+  SEP="&"
+fi
+if [[ "${CONFIG_URL}" != *"install_dir="* ]]; then
+  CONFIG_URL="${CONFIG_URL}${SEP}install_dir=$(printf '%s' "${INSTALL_DIR}" | sed 's/ /%20/g')"
+fi
+
+TOKEN="$(cat ${INSTALL_DIR}/.token 2>/dev/null || true)"
+if [ -n "${TOKEN_OVERRIDE}" ]; then TOKEN="${TOKEN_OVERRIDE}"; fi
+PROXY_PREFIX="${PROXY_PREFIX_OVERRIDE:-${PROXY_PREFIX:-}}"
+if [ -n "${PROXY_PREFIX}" ]; then PROXY_PREFIX="${PROXY_PREFIX%/}/"; fi
+
+TMP=$(mktemp)
+if [ -n "${TOKEN}" ]; then
+  CURL_CMD=(curl -v -fsSL --connect-timeout 10 --max-time 30 -H "Authorization: Bearer ${TOKEN}" "${PROXY_PREFIX}${CONFIG_URL}")
+else
+  CURL_CMD=(curl -v -fsSL --connect-timeout 10 --max-time 30 "${PROXY_PREFIX}${CONFIG_URL}")
+fi
+
+if "${CURL_CMD[@]}" -o "$TMP"; then
+  if ! cmp -s "$TMP" "${INSTALL_DIR}/config.json"; then
+    echo "[config-sync] config changed, updating and restarting..."
+    mv "$TMP" "${INSTALL_DIR}/config.json"
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl restart arouter
+    elif command -v launchctl >/dev/null 2>&1; then
+      sudo launchctl kickstart -k system/com.arouter.node || true
+    else
+      echo "[config-sync] no service manager found, please restart manually" >&2
+    fi
+  else
+    echo "[config-sync] no change"
+    rm -f "$TMP"
+  fi
+else
+  echo "[config-sync] fetch failed: CONFIG_URL=${CONFIG_URL} PROXY_PREFIX=${PROXY_PREFIX}"
+  rm -f "$TMP"
+fi
