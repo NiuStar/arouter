@@ -77,6 +77,7 @@ type Node struct {
 	Token           string      `json:"token"`
 	OSName          string      `json:"os_name"`
 	Arch            string      `json:"arch"`
+	PublicIPs       StringList  `json:"public_ips"`
 }
 
 type LinkMetric struct {
@@ -762,17 +763,18 @@ func main() {
 			From    string                     `json:"from"`
 			Metrics map[string]LinkMetricsJSON `json:"metrics"`
 			Status  struct {
-				CPUUsage    float64 `json:"cpu_usage"`
-				MemUsed     uint64  `json:"mem_used_bytes"`
-				MemTotal    uint64  `json:"mem_total_bytes"`
-				UptimeSec   uint64  `json:"uptime_sec"`
-				NetInBytes  uint64  `json:"net_in_bytes"`
-				NetOutBytes uint64  `json:"net_out_bytes"`
-				Version     string  `json:"version"`
-				Transport   string  `json:"transport"`
-				Compression string  `json:"compression"`
-				OS          string  `json:"os"`
-				Arch        string  `json:"arch"`
+				CPUUsage    float64  `json:"cpu_usage"`
+				MemUsed     uint64   `json:"mem_used_bytes"`
+				MemTotal    uint64   `json:"mem_total_bytes"`
+				UptimeSec   uint64   `json:"uptime_sec"`
+				NetInBytes  uint64   `json:"net_in_bytes"`
+				NetOutBytes uint64   `json:"net_out_bytes"`
+				Version     string   `json:"version"`
+				Transport   string   `json:"transport"`
+				Compression string   `json:"compression"`
+				OS          string   `json:"os"`
+				Arch        string   `json:"arch"`
+				PublicIPs   []string `json:"public_ips"`
 			} `json:"status"`
 		}
 		if err := c.ShouldBindJSON(&payload); err != nil {
@@ -800,6 +802,7 @@ func main() {
 			"compression":   firstNonEmpty(payload.Status.Compression, node.Compression),
 			"os_name":       payload.Status.OS,
 			"arch":          payload.Status.Arch,
+			"public_ips":    StringList(payload.Status.PublicIPs),
 		})
 		c.Status(http.StatusNoContent)
 	})
@@ -1745,6 +1748,7 @@ func ensureColumns(db *gorm.DB) {
 		{&Node{}, "node_version", "nodes", "TEXT"},
 		{&Node{}, "last_seen_at", "nodes", "DATETIME"},
 		{&Node{}, "token", "nodes", "TEXT"},
+		{&Node{}, "public_ips", "nodes", "TEXT"},
 		{&User{}, "username", "users", "TEXT"},
 		{&User{}, "password_hash", "users", "TEXT"},
 		{&User{}, "is_admin", "users", "BOOLEAN"},

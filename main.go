@@ -119,17 +119,18 @@ func (m *Metrics) AddDown(n int64) { atomic.AddInt64(&m.bytesDown, n) }
 
 // NodeStatus 描述节点自身运行状态，用于上报给控制器。
 type NodeStatus struct {
-	CPUUsage    float64 `json:"cpu_usage"`       // 0-100
-	MemUsed     uint64  `json:"mem_used_bytes"`  // 已用内存
-	MemTotal    uint64  `json:"mem_total_bytes"` // 总内存
-	UptimeSec   uint64  `json:"uptime_sec"`
-	NetInBytes  uint64  `json:"net_in_bytes"`
-	NetOutBytes uint64  `json:"net_out_bytes"`
-	Version     string  `json:"version"`
-	Transport   string  `json:"transport"`
-	Compression string  `json:"compression"`
-	OS          string  `json:"os"`
-	Arch        string  `json:"arch"`
+	CPUUsage    float64  `json:"cpu_usage"`       // 0-100
+	MemUsed     uint64   `json:"mem_used_bytes"`  // 已用内存
+	MemTotal    uint64   `json:"mem_total_bytes"` // 总内存
+	UptimeSec   uint64   `json:"uptime_sec"`
+	NetInBytes  uint64   `json:"net_in_bytes"`
+	NetOutBytes uint64   `json:"net_out_bytes"`
+	Version     string   `json:"version"`
+	Transport   string   `json:"transport"`
+	Compression string   `json:"compression"`
+	OS          string   `json:"os"`
+	Arch        string   `json:"arch"`
+	PublicIPs   []string `json:"public_ips"`
 }
 
 func (m *Metrics) Serve(addr string) *http.Server {
@@ -548,9 +549,101 @@ func detectOSInfo() (string, string) {
 	return runtime.GOOS, arch
 }
 
+func gatherPublicIPs() []string {
+	seen := make(map[string]struct{})
+	for _, ip := range publicIPsFromInterfaces() {
+		seen[ip] = struct{}{}
+	}
+	for _, ip := range []string{fetchPublicIPFromIPSB("tcp4"), fetchPublicIPFromIPSB("tcp6")} {
+		if ip == "" {
+			continue
+		}
+		seen[ip] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for ip := range seen {
+		out = append(out, ip)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func publicIPsFromInterfaces() []string {
+	ifaces, _ := net.Interfaces()
+	var res []string
+	for _, iface := range ifaces {
+		if (iface.Flags&net.FlagUp) == 0 || (iface.Flags&net.FlagLoopback) != 0 {
+			continue
+		}
+		addrs, _ := iface.Addrs()
+		for _, a := range addrs {
+			var ip net.IP
+			switch v := a.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil || isPrivateOrLinkLocal(ip) {
+				continue
+			}
+			res = append(res, ip.String())
+		}
+	}
+	return res
+}
+
+func fetchPublicIPFromIPSB(network string) string {
+	dialer := &net.Dialer{Timeout: 3 * time.Second}
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+			return dialer.DialContext(ctx, network, addr)
+		},
+	}
+	client := &http.Client{Timeout: 4 * time.Second, Transport: transport}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET", "https://ip.sb", nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 128))
+	ipStr := strings.TrimSpace(string(b))
+	ip := net.ParseIP(ipStr)
+	if ip == nil || isPrivateOrLinkLocal(ip) {
+		return ""
+	}
+	return ip.String()
+}
+
+func isPrivateOrLinkLocal(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true
+	}
+	if v4 := ip.To4(); v4 != nil {
+		if v4[0] == 10 || v4[0] == 127 {
+			return true
+		}
+		if v4[0] == 192 && v4[1] == 168 {
+			return true
+		}
+		if v4[0] == 172 && v4[1] >= 16 && v4[1] <= 31 {
+			return true
+		}
+		return false
+	}
+	if len(ip) == net.IPv6len && (ip[0]&0xfe) == 0xfc {
+		return true
+	}
+	return false
+}
+
 func gatherNodeStatus() NodeStatus {
 	status := NodeStatus{Version: buildVersion}
 	status.OS, status.Arch = detectOSInfo()
+	status.PublicIPs = gatherPublicIPs()
 
 	if snap, err := readCPUSnapshot(); err == nil {
 		if hasCPUSnap {

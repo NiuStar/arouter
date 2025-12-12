@@ -106,7 +106,8 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
   const [peerEditOpen, setPeerEditOpen] = useState(false);
   const [peerEditForm] = Form.useForm();
   const [editForm] = Form.useForm();
-  const [hostIPs, setHostIPs] = useState({interfaces:[], public_v4:'', public_v6:''});
+  const [peerIPOptions, setPeerIPOptions] = useState([]);
+  const [peerEditIPOptions, setPeerEditIPOptions] = useState([]);
 
   const load = async () => {
     try {
@@ -117,12 +118,18 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
   };
   useEffect(() => { load(); }, [node.id]);
 
-  const fetchIPs = async () => {
-    try {
-      const data = await api('GET', '/api/host/ips');
-      setHostIPs(data);
-    } catch (e) { message.error('获取IP失败: '+e.message); }
+  const nodePublicIPs = (name) => {
+    const n = (allNodes || []).find(x => x.name === name);
+    if (!n || !Array.isArray(n.public_ips)) return [];
+    return n.public_ips.filter(Boolean);
   };
+
+  useEffect(() => {
+    const name = peerForm.getFieldValue('peer_name');
+    if (name) setPeerIPOptions(nodePublicIPs(name));
+    const editName = peerEditForm.getFieldValue('peer_name');
+    if (editName) setPeerEditIPOptions(nodePublicIPs(editName));
+  }, [allNodes]);
 
   const addEntry = async () => {
     try {
@@ -168,7 +175,11 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
     { title: 'WS地址', dataIndex: 'endpoint' },
     { title: '操作',
       render:(_,r)=><Space>
-        <Button size="small" onClick={()=>{peerEditForm.setFieldsValue(r); setPeerEditOpen(true);}}>编辑</Button>
+        <Button size="small" onClick={()=>{
+          peerEditForm.setFieldsValue(r);
+          setPeerEditIPOptions(nodePublicIPs(r.peer_name));
+          setPeerEditOpen(true);
+        }}>编辑</Button>
         <Button danger size="small" onClick={()=>{
           Modal.confirm({title:'确认删除对端？', onOk: async ()=>{
             try{
@@ -262,10 +273,12 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
         { key:'routes', label:'线路', children:<>
           <Space style={{marginBottom:8}}>
             <Button type="primary" onClick={()=>setRouteOpen(true)}>添加线路</Button>
-            <Button onClick={fetchIPs}>刷新本机IP</Button>
-            <Tooltip title="自动探测的出口候选（过滤了私网地址）">
-              <span>V4: {hostIPs.public_v4||'-'} / V6: {hostIPs.public_v6||'-'}</span>
-            </Tooltip>
+            <span>
+              节点公网IP：
+              {(detail.public_ips||[]).length
+                ? (detail.public_ips||[]).map(ip=><Tag key={ip}>{ip}</Tag>)
+                : '未上报'}
+            </span>
           </Space>
           <Table rowKey="id" dataSource={detail.routes||[]} columns={routeCols} pagination={false}/>
         </>}
@@ -312,10 +325,23 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
               options={(allNodes || []).filter(n=>n.id!==detail.id).map(n=>({label:n.name, value:n.name}))}
               showSearch
               optionFilterProp="label"
+              onChange={(val)=>{setPeerEditIPOptions(nodePublicIPs(val)); peerEditForm.setFieldsValue({entry_ip: undefined, exit_ip: undefined});}}
             />
           </Form.Item>
-          <Form.Item name="entry_ip" label="入口IP (可选)"><Input placeholder="对端入口IP"/></Form.Item>
-          <Form.Item name="exit_ip" label="出口IP (可选)"><Input placeholder="本节点出口IP"/></Form.Item>
+          <Form.Item name="entry_ip" label="入口IP (可选)">
+            <Select
+              placeholder="从对端公网IP选择，可不选"
+              allowClear
+              options={peerEditIPOptions.map(ip=>({label:ip, value:ip}))}
+            />
+          </Form.Item>
+          <Form.Item name="exit_ip" label="出口IP (可选)">
+            <Select
+              placeholder="从对端公网IP选择，可不选"
+              allowClear
+              options={peerEditIPOptions.map(ip=>({label:ip, value:ip}))}
+            />
+          </Form.Item>
           <Form.Item name="endpoint" label="WS地址 (可选)"><Input placeholder="如留空则尝试根据入口IP+对端监听拼装"/></Form.Item>
         </Form>
       </Modal>
@@ -328,13 +354,22 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
               options={(allNodes || []).filter(n=>n.id!==detail.id).map(n=>({label:n.name, value:n.name}))}
               showSearch
               optionFilterProp="label"
+              onChange={(val)=>{setPeerIPOptions(nodePublicIPs(val)); peerForm.setFieldsValue({entry_ip: undefined, exit_ip: undefined});}}
             />
           </Form.Item>
           <Form.Item name="entry_ip" label="入口IP (可选)">
-            <Input placeholder="可选：对端入口IP"/>
+            <Select
+              placeholder="从对端公网IP选择，可不选"
+              allowClear
+              options={peerIPOptions.map(ip=>({label:ip, value:ip}))}
+            />
           </Form.Item>
           <Form.Item name="exit_ip" label="出口IP (可选)">
-            <Input placeholder="可选：本节点出口IP"/>
+            <Select
+              placeholder="从对端公网IP选择，可不选"
+              allowClear
+              options={peerIPOptions.map(ip=>({label:ip, value:ip}))}
+            />
           </Form.Item>
           <Form.Item name="endpoint" label="WS地址 (可选)">
             <Input placeholder="如留空则尝试根据入口IP+对端监听拼装"/>
@@ -375,7 +410,6 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
               showSearch optionFilterProp="label"
             />
           </Form.Item>
-          <Form.Item name="remote" label="远端 IP:Port (可选)"><Input placeholder="1.1.1.1:3389"/></Form.Item>
           <Form.Item name="priority" label="优先级" rules={[{required:true}]}><Input type="number" min={1}/></Form.Item>
           <Form.Item name="path" label="路径节点顺序" rules={[{required:true, message:'请选择路径'}]}>
             <Select
@@ -387,8 +421,12 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
           </Form.Item>
           <Divider>可选：入口/出口 IP 参考</Divider>
           <Space direction="vertical" style={{width:'100%'}}>
-            <div>本机公网探测：V4 {hostIPs.public_v4||'-'} / V6 {hostIPs.public_v6||'-'}</div>
-            <div>接口地址（已过滤私网）：{(hostIPs.interfaces||[]).map(i=><Tag key={i.iface+i.addr}>{i.iface}:{i.addr}</Tag>)}</div>
+            <div>
+              节点公网IP：
+              {(detail.public_ips||[]).length
+                ? (detail.public_ips||[]).map(ip=><Tag key={ip}>{ip}</Tag>)
+                : '未上报'}
+            </div>
           </Space>
         </Form>
       </Modal>
@@ -412,7 +450,6 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
               showSearch optionFilterProp="label"
             />
           </Form.Item>
-          <Form.Item name="remote" label="远端 IP:Port (可选)"><Input/></Form.Item>
           <Form.Item name="priority" label="优先级" rules={[{required:true}]}><Input type="number" min={1}/></Form.Item>
           <Form.Item name="path" label="路径节点顺序" rules={[{required:true}]}>
             <Select
