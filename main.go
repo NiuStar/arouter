@@ -42,6 +42,7 @@ import (
 )
 
 var buildVersion = "dev"
+var wsSessionCache = tls.NewLRUClientSessionCache(128)
 
 // 该版本实现了基础的 WSS 数据平面、JSON 配置加载、动态选路和简单的 RTT 探测。
 // 多跳通过 WebSocket 级联，出口节点将流量转发到 RemoteAddr。
@@ -1013,15 +1014,16 @@ func (p *WSProber) Probe(ctx context.Context, _, remote NodeID) (LinkMetrics, er
 	start := time.Now()
 	var c *websocket.Conn
 	var err error
-	trOpt := &http.Transport{TLSClientConfig: p.TLSConfig, Proxy: nil}
 	dialOpts := &websocket.DialOptions{
-		HTTPClient: &http.Client{Transport: trOpt},
+		HTTPClient:      fastWSClient(p.TLSConfig),
+		CompressionMode: websocket.CompressionDisabled,
 	}
 	c, _, err = websocket.Dial(ctxPing, url, dialOpts)
 	if err != nil && strings.HasPrefix(url, "wss://") {
 		wsURL := "ws://" + strings.TrimPrefix(url, "wss://")
 		c, _, err = websocket.Dial(ctxPing, wsURL, &websocket.DialOptions{
-			HTTPClient: &http.Client{Transport: &http.Transport{Proxy: nil}},
+			HTTPClient:      fastWSClient(nil),
+			CompressionMode: websocket.CompressionDisabled,
 		})
 		if err == nil {
 			url = wsURL
@@ -1109,6 +1111,27 @@ func normalizePeerEndpoint(raw string, mode string) string {
 	return "ws://" + strings.TrimRight(raw, "/") + "/mesh"
 }
 
+func fastWSClient(baseTLS *tls.Config) *http.Client {
+	tlsConf := cloneTLSWithServerName(baseTLS, "")
+	if tlsConf == nil {
+		tlsConf = &tls.Config{}
+	}
+	tlsConf.ClientSessionCache = wsSessionCache
+	tr := &http.Transport{
+		Proxy:               nil, // skip env proxy lookup to reduce dial latency
+		TLSClientConfig:     tlsConf,
+		MaxIdleConns:        256,
+		MaxIdleConnsPerHost: 64,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  true,
+		DialContext: (&net.Dialer{
+			Timeout:   3 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	}
+	return &http.Client{Transport: tr, Timeout: 6 * time.Second}
+}
+
 func configDigest(cfg nodeConfig) string {
 	b, _ := json.Marshal(cfg)
 	sum := sha256.Sum256(b)
@@ -1123,15 +1146,34 @@ type AckStatus struct {
 
 // ControlEnvelope 用于在数据桥接前传递控制信息（首帧 header、ack、错误）。
 type ControlEnvelope struct {
-	Type      string         `json:"type"` // header | ack | error
-	Session   string         `json:"session"`
-	Header    *ControlHeader `json:"header,omitempty"`
-	Ack       *AckStatus     `json:"ack,omitempty"`
-	Error     string         `json:"error,omitempty"`
-	Datagram  *UDPDatagram   `json:"datagram,omitempty"` // Type=udp
-	Signature string         `json:"sig,omitempty"`
-	Version   int            `json:"ver,omitempty"`
-	Timestamp int64          `json:"ts,omitempty"` // unix milli
+	Type        string           `json:"type"` // header | ack | error | probe_http | probe_result | udp
+	Session     string           `json:"session"`
+	Header      *ControlHeader   `json:"header,omitempty"`
+	Ack         *AckStatus       `json:"ack,omitempty"`
+	Error       string           `json:"error,omitempty"`
+	Datagram    *UDPDatagram     `json:"datagram,omitempty"` // Type=udp
+	Probe       *HTTPProbe       `json:"probe,omitempty"`
+	ProbeResult *HTTPProbeResult `json:"probe_result,omitempty"`
+	Signature   string           `json:"sig,omitempty"`
+	Version     int              `json:"ver,omitempty"`
+	Timestamp   int64            `json:"ts,omitempty"` // unix milli
+}
+
+type HTTPProbe struct {
+	Path   []NodeID `json:"path"`
+	Target string   `json:"target"`
+}
+
+type HTTPProbeResult struct {
+	Success bool   `json:"success"`
+	Status  int    `json:"status"`
+	Error   string `json:"error,omitempty"`
+}
+
+type pooledWS struct {
+	conn      *websocket.Conn
+	createdAt time.Time
+	inUse     int32
 }
 
 // WSSTransport 通过 WebSocket 级联转发，可同时监听 WS 与 WSS。
@@ -1149,6 +1191,8 @@ type WSSTransport struct {
 	Metrics       *Metrics
 	Compression   string
 	CompressMin   int
+	poolMu        sync.Mutex
+	pool          map[NodeID]*pooledWS
 }
 
 func (t *WSSTransport) Forward(ctx context.Context, src NodeID, path []NodeID, proto Protocol, downstream net.Conn, remoteAddr string) error {
@@ -1169,11 +1213,9 @@ func (t *WSSTransport) Forward(ctx context.Context, src NodeID, path []NodeID, p
 		Compression: t.Compression,
 		CompressMin: t.CompressMin,
 	}
-	ctxDial, cancel := context.WithTimeout(ctx, 5*time.Second)
+	ctxDial, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	c, _, err := websocket.Dial(ctxDial, targetURL, &websocket.DialOptions{
-		HTTPClient: &http.Client{Transport: &http.Transport{TLSClientConfig: t.TLSConfig}},
-	})
+	c, err := t.getOrDial(ctxDial, next, targetURL)
 	if err != nil {
 		downstream.Close()
 		return fmt.Errorf("dial next %s failed: %w", next, err)
@@ -1200,11 +1242,55 @@ func (t *WSSTransport) Forward(ctx context.Context, src NodeID, path []NodeID, p
 	wsConn := websocket.NetConn(ctx, c, websocket.MessageBinary)
 	go func() {
 		<-ctx.Done()
+		t.release(next, c)
 		c.Close(websocket.StatusNormalClosure, "ctx canceled")
 		wsConn.Close()
 	}()
 	// 首跳按照请求压缩，后续中间节点在转发时透传
 	return bridgeMaybeCompressed(session, downstream, wsConn, header.Compression, header.CompressMin, t.Metrics, path, remoteAddr)
+}
+
+// ProbeHTTP 在给定路径上发起 HTTP 探测（入口->多跳->出口->目标 URL），返回端到端耗时。
+func (t *WSSTransport) ProbeHTTP(ctx context.Context, path []NodeID, target string, timeout time.Duration) (time.Duration, error) {
+	if len(path) < 2 {
+		return 0, fmt.Errorf("path too short: %v", path)
+	}
+	if timeout <= 0 {
+		timeout = 20 * time.Second
+	}
+	next := path[1]
+	targetURL, ok := t.Endpoints[next]
+	if !ok {
+		return 0, fmt.Errorf("no endpoint for %s", next)
+	}
+	targetURL = normalizeWSEndpoint(targetURL)
+	session := newSessionID()
+	start := time.Now()
+	ctxDial, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	conn, err := t.getOrDial(ctxDial, next, targetURL)
+	if err != nil {
+		return 0, fmt.Errorf("dial next %s failed: %w", next, err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "probe done")
+	if err := writeSignedEnvelope(ctxDial, conn, ControlEnvelope{
+		Type:    "probe_http",
+		Session: session,
+		Probe: &HTTPProbe{
+			Path:   path[1:],
+			Target: target,
+		},
+	}, t.AuthKey); err != nil {
+		return 0, fmt.Errorf("send probe failed: %w", err)
+	}
+	res, err := readVerifiedEnvelope(ctxDial, conn, t.AuthKey)
+	if err != nil {
+		return 0, fmt.Errorf("wait probe result failed: %w", err)
+	}
+	if res.Type != "probe_result" || res.ProbeResult == nil {
+		return 0, fmt.Errorf("unexpected response %s", res.Type)
+	}
+	return time.Since(start), nil
 }
 
 // ReconnectTCP 在桥接出错时尝试重新选路重建连接。
@@ -1246,11 +1332,9 @@ func (t *WSSTransport) OpenUDPSession(ctx context.Context, path []NodeID, remote
 		Compression: t.Compression,
 		CompressMin: t.CompressMin,
 	}
-	ctxDial, cancel := context.WithTimeout(ctx, 5*time.Second)
+	ctxDial, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	c, _, err := websocket.Dial(ctxDial, targetURL, &websocket.DialOptions{
-		HTTPClient: &http.Client{Transport: &http.Transport{TLSClientConfig: t.TLSConfig}},
-	})
+	c, err := t.getOrDial(ctxDial, next, targetURL)
 	if err != nil {
 		return nil, "", fmt.Errorf("dial next %s failed: %w", next, err)
 	}
@@ -1280,6 +1364,7 @@ func (t *WSSTransport) Serve(ctx context.Context) error {
 	mux.HandleFunc("/mesh", func(w http.ResponseWriter, r *http.Request) {
 		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			InsecureSkipVerify: t.TLSConfig != nil && t.TLSConfig.InsecureSkipVerify,
+			CompressionMode:    websocket.CompressionDisabled,
 		})
 		if err != nil {
 			log.Printf("accept ws failed: %v", err)
@@ -1291,6 +1376,7 @@ func (t *WSSTransport) Serve(ctx context.Context) error {
 	mux.HandleFunc("/probe", func(w http.ResponseWriter, r *http.Request) {
 		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			InsecureSkipVerify: t.TLSConfig != nil && t.TLSConfig.InsecureSkipVerify,
+			CompressionMode:    websocket.CompressionDisabled,
 		})
 		if err != nil {
 			log.Printf("accept ws probe failed: %v", err)
@@ -1363,6 +1449,10 @@ func (t *WSSTransport) handleConn(ctx context.Context, c *websocket.Conn) {
 		log.Printf("read header failed: %v", err)
 		return
 	}
+	if env.Type == "probe_http" && env.Probe != nil {
+		t.handleHTTPProbe(ctx, c, env)
+		return
+	}
 	if env.Type != "header" || env.Header == nil {
 		log.Printf("unexpected envelope type %s", env.Type)
 		return
@@ -1405,11 +1495,9 @@ func (t *WSSTransport) handleConn(ctx context.Context, c *websocket.Conn) {
 		log.Printf("no endpoint for next hop %s", next)
 		return
 	}
-	ctxDial, cancel := context.WithTimeout(ctx, 5*time.Second)
+	ctxDial, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	nextConn, _, err := websocket.Dial(ctxDial, targetURL, &websocket.DialOptions{
-		HTTPClient: &http.Client{Transport: &http.Transport{TLSClientConfig: t.TLSConfig}},
-	})
+	nextConn, err := t.getOrDial(ctxDial, next, targetURL)
 	if err != nil {
 		log.Printf("dial next hop %s failed: %v", next, err)
 		return
@@ -1457,6 +1545,138 @@ func (t *WSSTransport) handleConn(ctx context.Context, c *websocket.Conn) {
 	downstream := websocket.NetConn(ctx, nextConn, websocket.MessageBinary)
 	if err := bridgeWithLogging(session, upstream, downstream, t.Metrics); err != nil {
 		log.Printf("[session=%s] bridge failed: %v", session, err)
+	}
+}
+
+func (t *WSSTransport) handleHTTPProbe(ctx context.Context, c *websocket.Conn, env ControlEnvelope) {
+	probe := env.Probe
+	session := env.Session
+	if probe == nil || len(probe.Path) == 0 {
+		log.Printf("[session=%s] empty probe path", session)
+		return
+	}
+	if probe.Path[0] != t.Self {
+		log.Printf("[session=%s] probe path not for me: %v", session, probe.Path)
+		return
+	}
+	remaining := probe.Path[1:]
+	if len(remaining) == 0 {
+		// 我是出口，直接访问目标
+		ctxReq, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		req, _ := http.NewRequestWithContext(ctxReq, "GET", probe.Target, nil)
+		resp, err := http.DefaultClient.Do(req)
+		result := &HTTPProbeResult{}
+		if err != nil {
+			result.Error = err.Error()
+		} else {
+			result.Status = resp.StatusCode
+			resp.Body.Close()
+			if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+				result.Success = true
+			} else {
+				result.Error = resp.Status
+			}
+		}
+		_ = writeSignedEnvelope(ctx, c, ControlEnvelope{
+			Type:        "probe_result",
+			Session:     session,
+			ProbeResult: result,
+		}, t.AuthKey)
+		return
+	}
+
+	// 中间节点转发
+	next := remaining[0]
+	targetURL, ok := t.Endpoints[next]
+	if !ok {
+		log.Printf("[session=%s] probe no endpoint for %s", session, next)
+		return
+	}
+	ctxDial, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	nextConn, _, err := websocket.Dial(ctxDial, targetURL, &websocket.DialOptions{
+		HTTPClient:      fastWSClient(t.TLSConfig),
+		CompressionMode: websocket.CompressionDisabled,
+	})
+	if err != nil {
+		log.Printf("[session=%s] probe dial next %s failed: %v", session, next, err)
+		return
+	}
+	defer nextConn.Close(websocket.StatusNormalClosure, "probe relay done")
+	if err := writeSignedEnvelope(ctxDial, nextConn, ControlEnvelope{
+		Type:    "probe_http",
+		Session: session,
+		Probe: &HTTPProbe{
+			Path:   remaining,
+			Target: probe.Target,
+		},
+	}, t.AuthKey); err != nil {
+		log.Printf("[session=%s] probe forward failed: %v", session, err)
+		return
+	}
+	resEnv, err := readVerifiedEnvelope(ctxDial, nextConn, t.AuthKey)
+	if err != nil {
+		log.Printf("[session=%s] probe await result failed: %v", session, err)
+		return
+	}
+	if resEnv.Type != "probe_result" || resEnv.ProbeResult == nil {
+		log.Printf("[session=%s] probe got unexpected %s", session, resEnv.Type)
+		return
+	}
+	_ = writeSignedEnvelope(ctx, c, resEnv, t.AuthKey)
+}
+
+func (t *WSSTransport) getOrDial(ctx context.Context, next NodeID, url string) (*websocket.Conn, error) {
+	t.poolMu.Lock()
+	if t.pool == nil {
+		t.pool = make(map[NodeID]*pooledWS)
+	}
+	if p := t.pool[next]; p != nil && p.conn != nil {
+		atomic.AddInt32(&p.inUse, 1)
+		t.poolMu.Unlock()
+		return p.conn, nil
+	}
+	t.poolMu.Unlock()
+	conn, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{
+		HTTPClient:      fastWSClient(t.TLSConfig),
+		CompressionMode: websocket.CompressionDisabled,
+	})
+	if err != nil {
+		return nil, err
+	}
+	t.poolMu.Lock()
+	t.pool[next] = &pooledWS{conn: conn, createdAt: time.Now(), inUse: 1}
+	t.poolMu.Unlock()
+	go t.keepalive(next, conn)
+	return conn, nil
+}
+
+func (t *WSSTransport) release(next NodeID, conn *websocket.Conn) {
+	t.poolMu.Lock()
+	if p := t.pool[next]; p != nil && p.conn == conn {
+		atomic.AddInt32(&p.inUse, -1)
+	}
+	t.poolMu.Unlock()
+}
+
+func (t *WSSTransport) evict(next NodeID, conn *websocket.Conn) {
+	t.poolMu.Lock()
+	if p := t.pool[next]; p != nil && p.conn == conn {
+		delete(t.pool, next)
+	}
+	t.poolMu.Unlock()
+}
+
+func (t *WSSTransport) keepalive(next NodeID, conn *websocket.Conn) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		if err := conn.Ping(context.Background()); err != nil {
+			t.evict(next, conn)
+			conn.Close(websocket.StatusInternalError, "ping failed")
+			return
+		}
 	}
 }
 
@@ -1957,6 +2177,7 @@ type Node struct {
 	Compression    string
 	CompressionMin int
 	TransportMode  string
+	HTTPProbeURL   string
 	CertPath       string
 	KeyPath        string
 	AuthKey        []byte
@@ -1989,6 +2210,7 @@ func (n *Node) Start(ctx context.Context) error {
 		go n.pullRoutesLoop(ctx)
 		go n.fetchCertLoop(ctx)
 	}
+	go n.probeRoutesLoop(ctx)
 	go func() {
 		if err := n.Transport.Serve(ctx); err != nil {
 			log.Printf("transport server stopped: %v", err)
@@ -2078,6 +2300,95 @@ func (n *Node) routeAttempts(exit NodeID, remote string) int {
 		attempts = 1
 	}
 	return attempts
+}
+
+func (n *Node) probeRoutesLoop(ctx context.Context) {
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	n.runRouteProbes(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			n.runRouteProbes(ctx)
+		}
+	}
+}
+
+func (n *Node) runRouteProbes(ctx context.Context) {
+	ws, ok := n.Transport.(*WSSTransport)
+	if !ok {
+		return
+	}
+	n.routeMu.RLock()
+	plans := make([]ManualRoute, 0)
+	for _, rs := range n.routePlans {
+		plans = append(plans, rs...)
+	}
+	n.routeMu.RUnlock()
+	for _, r := range plans {
+		if len(r.Path) < 2 || r.Path[0] != n.ID {
+			continue
+		}
+		dur, err := ws.ProbeHTTP(ctx, r.Path, n.HTTPProbeURL, 20*time.Second)
+		success := err == nil
+		if err != nil {
+			log.Printf("[probe route %s] failed: %v", r.Name, err)
+		}
+		_ = n.reportProbe(ctx, r, dur, success, err)
+	}
+}
+
+func (n *Node) reportProbe(ctx context.Context, r ManualRoute, dur time.Duration, success bool, err error) error {
+	if n.ControllerURL == "" {
+		return nil
+	}
+	reqBody := struct {
+		Route   string   `json:"route"`
+		Path    []string `json:"path"`
+		RTTMs   int64    `json:"rtt_ms"`
+		Success bool     `json:"success"`
+		Error   string   `json:"error"`
+	}{
+		Route:   r.Name,
+		Path:    nodeIDsToStrings(r.Path),
+		RTTMs:   dur.Milliseconds(),
+		Success: success,
+	}
+	if err != nil {
+		reqBody.Error = err.Error()
+	}
+	data, _ := json.Marshal(reqBody)
+	ctxReq, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	url := strings.TrimRight(n.ControllerURL, "/") + "/api/probe/e2e"
+	req, _ := http.NewRequestWithContext(ctxReq, "POST", url, bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/json")
+	if len(n.AuthKey) > 0 {
+		req.Header.Set("Authorization", "Bearer "+string(n.AuthKey))
+	}
+	if tok := n.loadToken(); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	resp, errDo := http.DefaultClient.Do(req)
+	if errDo != nil {
+		return errDo
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		log.Printf("[probe route %s] report non-2xx: %s body=%s", r.Name, resp.Status, string(body))
+	}
+	return nil
+}
+
+func nodeIDsToStrings(ids []NodeID) []string {
+	out := make([]string, len(ids))
+	for i, v := range ids {
+		out[i] = string(v)
+	}
+	return out
 }
 
 func (n *Node) serveTCP(ctx context.Context, ep EntryPort) {
@@ -2295,6 +2606,7 @@ type nodeConfig struct {
 	Transport       string            `json:"transport"`
 	TokenPath       string            `json:"token_path"`
 	DebugLog        bool              `json:"debug_log"`
+	HTTPProbeURL    string            `json:"http_probe_url"`
 }
 
 func loadConfig(path string) (nodeConfig, error) {
@@ -2319,6 +2631,9 @@ func loadConfig(path string) (nodeConfig, error) {
 	}
 	if cfg.Transport == "" {
 		cfg.Transport = "quic"
+	}
+	if strings.TrimSpace(cfg.HTTPProbeURL) == "" {
+		cfg.HTTPProbeURL = "https://www.google.com/generate_204"
 	}
 	// 默认证书/密钥路径并按平台重写
 	if cfg.MTLSCert == "" {
@@ -2741,6 +3056,7 @@ func main() {
 			Compression:    compression,
 			CompressionMin: cfg.CompressionMin,
 			TransportMode:  mode,
+			HTTPProbeURL:   cfg.HTTPProbeURL,
 			CertPath:       platformPath(defaultIfEmpty(cfg.MTLSCert, "/opt/arouter/certs/arouter.crt")),
 			KeyPath:        platformPath(defaultIfEmpty(cfg.MTLSKey, "/opt/arouter/certs/arouter.key")),
 			AuthKey:        authKey,

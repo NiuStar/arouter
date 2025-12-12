@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Layout, Table, Button, Modal, Form, Input, Space, message, Tabs, Card, Descriptions, Select, Tag, Divider, Tooltip, Row, Col, Statistic } from 'antd';
+import { Layout, Table, Button, Modal, Form, Input, Space, message, Tabs, Card, Descriptions, Select, Tag, Divider, Tooltip, Row, Col, Statistic, Drawer, Menu } from 'antd';
 import { api } from './api';
 
 const { Header, Content } = Layout;
@@ -465,6 +465,70 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
   );
 }
 
+function RouteList() {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const load = async () => {
+    setLoading(true);
+    try {
+      const [nodes, probes] = await Promise.all([
+        api('GET', '/api/nodes'),
+        api('GET', '/api/probes'),
+      ]);
+      const probeMap = new Map();
+      (probes||[]).forEach(p => {
+        probeMap.set(`${p.node}::${p.route}`, p);
+      });
+      const r = [];
+      (nodes||[]).forEach(n => {
+        (n.routes||[]).forEach(rt => {
+          const key = `${n.name}::${rt.name}`;
+          const pb = probeMap.get(key);
+          r.push({
+            key,
+            node: n.name,
+            route: rt.name,
+            exit: rt.exit,
+            priority: rt.priority,
+            path: rt.path || [],
+            probe: pb || null,
+          });
+        });
+      });
+      setRows(r);
+    } catch (e) { message.error(e.message); }
+    setLoading(false);
+  };
+  useEffect(() => { load(); const t=setInterval(load, 10000); return ()=>clearInterval(t); }, []);
+  const cols = [
+    { title:'节点', dataIndex:'node' },
+    { title:'线路', dataIndex:'route' },
+    { title:'出口', dataIndex:'exit' },
+    { title:'优先级', dataIndex:'priority' },
+    { title:'路径', dataIndex:'path', render:p=>(p||[]).map(x=><Tag key={x}>{x}</Tag>) },
+    { title:'延迟(ms)', render:(_,r)=>{
+      const pb = r.probe;
+      if (!pb) return '-';
+      return pb.success ? pb.rtt_ms : '失败';
+    }},
+    { title:'状态', render:(_,r)=>{
+      const pb = r.probe;
+      if (!pb) return <Tag>未上报</Tag>;
+      return pb.success ? <Tag color="green">成功</Tag> : <Tag color="red">失败</Tag>;
+    }},
+    { title:'更新时间', render:(_,r)=>{
+      const pb = r.probe;
+      if (!pb || !pb.updated_at) return '-';
+      return new Date(pb.updated_at).toLocaleString();
+    }},
+  ];
+  return (
+    <Card title="线路列表（含端到端延迟）">
+      <Table rowKey="key" dataSource={rows} columns={cols} loading={loading} pagination={false}/>
+    </Card>
+  );
+}
+
 export default function App() {
   const [selected, setSelected] = useState(null);
   const [tick, setTick] = useState(0);
@@ -477,6 +541,8 @@ export default function App() {
   const [userModal, setUserModal] = useState(false);
   const [userForm] = Form.useForm();
   const [editUser, setEditUser] = useState(null);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [view, setView] = useState('dashboard');
   const refreshList = ()=> setTick(t=>t+1);
 
   const showInstall = (node) => {
@@ -523,6 +589,7 @@ export default function App() {
     setToken('');
     setSelected(null);
     setLoginOpen(true);
+    setView('dashboard');
   };
 
   const loadUsers = async () => {
@@ -544,6 +611,7 @@ export default function App() {
       transport: settings.transport || 'quic',
       compression: settings.compression || 'none',
       compression_min_bytes: settings.compression_min_bytes || 0,
+      http_probe_url: settings.http_probe_url || 'https://www.google.com/generate_204',
       debug_log: settings.debug_log || false,
     }); }, [settings]);
     const onSave = async () => {
@@ -570,6 +638,9 @@ export default function App() {
           </Form.Item>
           <Form.Item name="compression_min_bytes" label="压缩阈值(Bytes)" tooltip="小于该大小直传不压缩，0表示总是压缩" style={{marginLeft:16}}>
             <Input type="number" min={0} style={{width:200}}/>
+          </Form.Item>
+          <Form.Item name="http_probe_url" label="HTTP探测URL" style={{marginLeft:16}}>
+            <Input style={{width:320}} placeholder="https://www.google.com/generate_204"/>
           </Form.Item>
           <Form.Item name="debug_log" label="调试日志" style={{marginLeft:16}}>
             <Select style={{width:140}} options={[{value:true,label:'开启'},{value:false,label:'关闭'}]}/>
@@ -602,17 +673,33 @@ export default function App() {
   return (
     <Layout style={{minHeight:'100vh'}}>
       <Header style={{color:'#fff', fontSize:18, display:'flex', justifyContent:'space-between'}}>
-        <div>ARouter 控制台</div>
+        <Space>
+          <Button type="text" style={{color:'#fff'}} onClick={()=>setDrawerOpen(true)}>≡</Button>
+          <div>ARouter 控制台</div>
+        </Space>
         <Space>
           <Button size="small" onClick={logout}>退出</Button>
           <Button size="small" onClick={()=>{setEditUser(null); userForm.resetFields(); setUserModal(true);}}>用户管理</Button>
         </Space>
       </Header>
       <Content style={{padding:24}}>
+        <Space style={{marginBottom:12}}>
+          <Button onClick={()=>refreshList()}>刷新</Button>
+          <Button onClick={()=>{setSelected(null); setView('dashboard');}}>节点概览</Button>
+          <Button onClick={()=>setView('routes')}>线路列表</Button>
+          <Button onClick={()=>setLoginOpen(true)}>切换账号</Button>
+          <Button onClick={showInstall}>安装节点</Button>
+          {settings && <Tag color="blue">默认传输：{(settings.transport||'quic').toUpperCase()}</Tag>}
+          {settings && <Tag color="purple">默认压缩：{settings.compression||'none'}</Tag>}
+          {settings && settings.http_probe_url ? <Tag color="geekblue">探测URL：{settings.http_probe_url}</Tag> : null}
+        </Space>
         <SettingsCard/>
-        {selected
-          ? <NodeDetail key={selected.id} node={selected} onBack={()=>setSelected(null)} refreshList={refreshList} onShowInstall={showInstall}/>
-          : <NodeList key={tick} onSelect={setSelected} onShowInstall={showInstall}/>
+        {view === 'routes'
+          ? <RouteList/>
+          : (selected
+            ? <NodeDetail key={selected.id} node={selected} onBack={()=>setSelected(null)} refreshList={refreshList} onShowInstall={showInstall}/>
+            : <NodeList key={tick} onSelect={setSelected} onShowInstall={showInstall}/>
+          )
         }
         <Modal open={installOpen} onCancel={()=>setInstallOpen(false)} onOk={copyCmd} okText="复制命令">
           <p>在目标节点执行以下命令以安装并自启动：</p>
@@ -658,6 +745,17 @@ export default function App() {
           </Form>
         </Modal>
       </Content>
+      <Drawer placement="left" open={drawerOpen} onClose={()=>setDrawerOpen(false)} width={220} title="导航">
+        <Menu
+          mode="inline"
+          selectedKeys={[view]}
+          onClick={({key})=>{setView(key); setDrawerOpen(false); if(key==='dashboard') setSelected(null);}}
+          items={[
+            {key:'dashboard', label:'节点概览'},
+            {key:'routes', label:'线路列表'},
+          ]}
+        />
+      </Drawer>
     </Layout>
   );
 }

@@ -27,6 +27,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var buildVersion = "dev"
@@ -161,6 +162,19 @@ type Setting struct {
 	Compression    string `json:"compression"`
 	CompressionMin int    `json:"compression_min_bytes"`
 	DebugLog       bool   `json:"debug_log"`
+	HTTPProbeURL   string `json:"http_probe_url"`
+}
+
+type RouteProbe struct {
+	ID        uint       `gorm:"primaryKey" json:"id"`
+	CreatedAt time.Time  `json:"created_at"`
+	UpdatedAt time.Time  `json:"updated_at"`
+	Node      string     `gorm:"uniqueIndex:idx_node_route" json:"node"`
+	Route     string     `gorm:"uniqueIndex:idx_node_route" json:"route"`
+	Path      StringList `json:"path"`
+	RTTMs     int64      `json:"rtt_ms"`
+	Success   bool       `json:"success"`
+	Error     string     `json:"error"`
 }
 
 type UserClaims struct {
@@ -194,6 +208,7 @@ type ConfigResponse struct {
 	TokenPath       string            `json:"token_path,omitempty"`
 	OS              string            `json:"os,omitempty"`
 	Arch            string            `json:"arch,omitempty"`
+	HTTPProbeURL    string            `json:"http_probe_url,omitempty"`
 }
 
 // applyOSOverrides 根据 os hint（例如 darwin）调整默认路径，便于节点在不同平台使用合适的目录。
@@ -257,7 +272,7 @@ func main() {
 	db := mustOpenDB()
 	auth := NewGlobalAuth(envOrDefault("AUTH_KEY_FILE", "/app/data/auth.key"))
 	globalKey := auth.LoadOrCreate()
-	if err := db.AutoMigrate(&Node{}, &Entry{}, &Peer{}, &LinkMetric{}, &RoutePlan{}, &Setting{}, &User{}); err != nil {
+	if err := db.AutoMigrate(&Node{}, &Entry{}, &Peer{}, &LinkMetric{}, &RoutePlan{}, &Setting{}, &User{}, &RouteProbe{}); err != nil {
 		log.Fatalf("migrate failed: %v", err)
 	}
 	ensureColumns(db)
@@ -807,6 +822,52 @@ func main() {
 		c.Status(http.StatusNoContent)
 	})
 
+	api.POST("/probe/e2e", func(c *gin.Context) {
+		nodeToken := getBearerToken(c)
+		node, err := findNodeByToken(db, nodeToken)
+		if err != nil {
+			c.AbortWithStatus(http.StatusUnauthorized)
+			return
+		}
+		var req struct {
+			Route   string   `json:"route"`
+			Path    []string `json:"path"`
+			RTTMs   int64    `json:"rtt_ms"`
+			Success bool     `json:"success"`
+			Error   string   `json:"error"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.String(http.StatusBadRequest, "bad request: %v", err)
+			return
+		}
+		if strings.TrimSpace(req.Route) == "" || len(req.Path) == 0 {
+			c.String(http.StatusBadRequest, "route and path required")
+			return
+		}
+		probe := RouteProbe{
+			Node:    node.Name,
+			Route:   req.Route,
+			Path:    StringList(req.Path),
+			RTTMs:   req.RTTMs,
+			Success: req.Success,
+			Error:   req.Error,
+		}
+		if err := db.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "node"}, {Name: "route"}},
+			DoUpdates: clause.Assignments(map[string]interface{}{"path": probe.Path, "rtt_ms": probe.RTTMs, "success": probe.Success, "error": probe.Error, "updated_at": time.Now()}),
+		}).Create(&probe).Error; err != nil {
+			c.String(http.StatusInternalServerError, "save failed: %v", err)
+			return
+		}
+		c.Status(http.StatusNoContent)
+	})
+
+	authGroup.GET("/probes", func(c *gin.Context) {
+		var probes []RouteProbe
+		db.Order("updated_at desc").Find(&probes)
+		c.JSON(http.StatusOK, probes)
+	})
+
 	api.GET("/topology", func(c *gin.Context) {
 		nodeToken := getBearerToken(c)
 		if _, err := findNodeByToken(db, nodeToken); err != nil {
@@ -1003,6 +1064,9 @@ func main() {
 			s.CompressionMin = req.CompressionMin
 		}
 		s.DebugLog = req.DebugLog
+		if strings.TrimSpace(req.HTTPProbeURL) != "" {
+			s.HTTPProbeURL = strings.TrimSpace(req.HTTPProbeURL)
+		}
 		if err := db.Save(&s).Error; err != nil {
 			c.String(http.StatusInternalServerError, err.Error())
 			return
@@ -1109,6 +1173,7 @@ func buildConfig(node Node, allNodes []Node, globalKey string, controllerBase st
 		TokenPath:       "/opt/arouter/.token",
 		OS:              node.OSName,
 		Arch:            node.Arch,
+		HTTPProbeURL:    settings.HTTPProbeURL,
 	}
 }
 
@@ -1584,6 +1649,7 @@ func ensureGlobalSettings(db *gorm.DB) {
 			Compression:    envOrDefault("GLOBAL_COMPRESSION", "none"),
 			CompressionMin: 0,
 			DebugLog:       false,
+			HTTPProbeURL:   envOrDefault("GLOBAL_HTTP_PROBE_URL", "https://www.google.com/generate_204"),
 		}
 		if err := db.Create(&def).Error; err != nil {
 			log.Printf("create default settings failed: %v", err)
@@ -1602,7 +1668,11 @@ func loadSettings(db *gorm.DB) Setting {
 			Compression:    envOrDefault("GLOBAL_COMPRESSION", "none"),
 			CompressionMin: 0,
 			DebugLog:       false,
+			HTTPProbeURL:   envOrDefault("GLOBAL_HTTP_PROBE_URL", "https://www.google.com/generate_204"),
 		}
+	}
+	if strings.TrimSpace(s.HTTPProbeURL) == "" {
+		s.HTTPProbeURL = envOrDefault("GLOBAL_HTTP_PROBE_URL", "https://www.google.com/generate_204")
 	}
 	return s
 }
@@ -1753,6 +1823,7 @@ func ensureColumns(db *gorm.DB) {
 		{&User{}, "password_hash", "users", "TEXT"},
 		{&User{}, "is_admin", "users", "BOOLEAN"},
 		{&Setting{}, "debug_log", "settings", "BOOLEAN"},
+		{&Setting{}, "http_probe_url", "settings", "TEXT"},
 		{&Peer{}, "entry_ip", "peers", "TEXT"},
 		{&Peer{}, "exit_ip", "peers", "TEXT"},
 	}
